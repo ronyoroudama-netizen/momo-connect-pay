@@ -1,7 +1,7 @@
 const { pool } = require("./db");
 
 const RATE_API_URL = "https://open.er-api.com/v6/latest/BRL";
-const DEFAULT_MARGIN_PERCENT = 3;
+const DEFAULT_MARGIN_PERCENT = 2;
 
 async function getSetting(key) {
   const { rows } = await pool.query("SELECT value FROM settings WHERE key = $1", [key]);
