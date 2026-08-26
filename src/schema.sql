@@ -40,3 +40,6 @@ INSERT INTO settings (key, value) VALUES ('whatsapp', '5519982117687') ON CONFLI
 INSERT INTO settings (key, value) VALUES ('companyName', 'Momo Connect Ltda') ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('rateXofPerBrl', '105') ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('rateUpdatedAt', '') ON CONFLICT (key) DO NOTHING;
+INSERT INTO settings (key, value) VALUES ('rateSource', 'auto') ON CONFLICT (key) DO NOTHING;
+INSERT INTO settings (key, value) VALUES ('rateMarginPercent', '2') ON CONFLICT (key) DO NOTHING;
+INSERT INTO settings (key, value) VALUES ('rateRawMarketRate', '') ON CONFLICT (key) DO NOTHING;
