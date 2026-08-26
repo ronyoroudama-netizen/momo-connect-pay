@@ -5,6 +5,7 @@ const cors = require("cors");
 const { pool, initSchema } = require("./db");
 const { onlyDigits, isValidCPF, isValidEmail, generateReference } = require("./validators");
 const { issueAdminToken, requireAdmin } = require("./auth");
+const { fetchAndApplyRate, startRateScheduler } = require("./rateUpdater");
 
 if (!process.env.JWT_SECRET || !process.env.ADMIN_PASSWORD) {
   console.error("ERREUR: définissez ADMIN_PASSWORD et JWT_SECRET dans votre fichier .env avant de démarrer.");
@@ -16,8 +17,6 @@ app.use(express.json());
 
 const allowedOrigins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
 app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
-
-// ---------- Helpers settings ----------
 
 async function getAllSettings() {
   const { rows } = await pool.query("SELECT key, value FROM settings");
@@ -34,6 +33,7 @@ async function getPublicSettings() {
     companyName: s.companyName,
     rateXofPerBrl: parseFloat(s.rateXofPerBrl) || 0,
     rateUpdatedAt: s.rateUpdatedAt || null,
+    rateSource: s.rateSource || "auto",
   };
 }
 
@@ -61,13 +61,10 @@ function asyncRoute(fn) {
   return (req, res, next) => fn(req, res, next).catch(next);
 }
 
-// ---------- Routes publiques ----------
-
 app.get("/api/settings", asyncRoute(async (req, res) => {
   res.json(await getPublicSettings());
 }));
 
-// Créer une nouvelle demande (fin des étapes 1+2 du formulaire client)
 app.post("/api/demandes", asyncRoute(async (req, res) => {
   const b = req.body || {};
   const errors = {};
@@ -108,7 +105,7 @@ app.post("/api/demandes", asyncRoute(async (req, res) => {
       );
       break;
     } catch (err) {
-      if (err.code !== "23505") throw err; // 23505 = violation de contrainte unique (référence déjà prise) -> on retente
+      if (err.code !== "23505") throw err;
       if (attempt === 4) return res.status(500).json({ error: "Impossible de générer une référence unique. Réessayez." });
     }
   }
@@ -116,14 +113,12 @@ app.post("/api/demandes", asyncRoute(async (req, res) => {
   res.status(201).json({ reference });
 }));
 
-// Suivre une demande par référence (utilisé par la page de suivi ET la page de paiement)
 app.get("/api/demandes/:reference", asyncRoute(async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM demandes WHERE reference = $1", [req.params.reference.toUpperCase()]);
   if (!rows[0]) return res.status(404).json({ error: "Aucune demande trouvée avec cette référence." });
   res.json(rowToDemande(rows[0]));
 }));
 
-// Le client déclare avoir payé
 app.post("/api/demandes/:reference/declare-paid", asyncRoute(async (req, res) => {
   const ref = req.params.reference.toUpperCase();
   const { rows } = await pool.query("SELECT * FROM demandes WHERE reference = $1", [ref]);
@@ -135,8 +130,6 @@ app.post("/api/demandes/:reference/declare-paid", asyncRoute(async (req, res) =>
   res.json(rowToDemande(updated.rows[0]));
 }));
 
-// ---------- Authentification admin ----------
-
 app.post("/api/admin/login", (req, res) => {
   const { password } = req.body || {};
   if (password !== process.env.ADMIN_PASSWORD) {
@@ -144,8 +137,6 @@ app.post("/api/admin/login", (req, res) => {
   }
   res.json({ token: issueAdminToken() });
 });
-
-// ---------- Routes admin (protégées) ----------
 
 app.get("/api/admin/demandes", requireAdmin, asyncRoute(async (req, res) => {
   const { rows } = await pool.query("SELECT * FROM demandes ORDER BY created_at DESC");
@@ -159,7 +150,6 @@ app.post("/api/admin/demandes/:reference/confirm", requireAdmin, asyncRoute(asyn
   await pool.query("UPDATE demandes SET status = 'confirmed', confirmed_at = $1 WHERE reference = $2", [new Date().toISOString(), ref]);
   const updated = await pool.query("SELECT * FROM demandes WHERE reference = $1", [ref]);
   res.json(rowToDemande(updated.rows[0]));
-  // TODO: déclencher ici l'envoi des e-mails de notification (client + Momo Connect) une fois le service d'e-mail branché.
 }));
 
 app.get("/api/admin/settings", requireAdmin, asyncRoute(async (req, res) => {
@@ -167,7 +157,7 @@ app.get("/api/admin/settings", requireAdmin, asyncRoute(async (req, res) => {
 }));
 
 app.post("/api/admin/settings", requireAdmin, asyncRoute(async (req, res) => {
-  const allowed = ["pixKey", "whatsapp", "companyName", "rateXofPerBrl"];
+  const allowed = ["pixKey", "whatsapp", "companyName", "rateXofPerBrl", "rateSource", "rateMarginPercent"];
   const b = req.body || {};
 
   const client = await pool.connect();
@@ -181,7 +171,7 @@ app.post("/api/admin/settings", requireAdmin, asyncRoute(async (req, res) => {
         );
       }
     }
-    if (b.rateXofPerBrl !== undefined) {
+    if (b.rateXofPerBrl !== undefined || b.rateMarginPercent !== undefined) {
       await client.query(
         "INSERT INTO settings (key, value) VALUES ('rateUpdatedAt', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         [new Date().toISOString()]
@@ -198,7 +188,11 @@ app.post("/api/admin/settings", requireAdmin, asyncRoute(async (req, res) => {
   res.json(await getAllSettings());
 }));
 
-// Gestion d'erreur générique (attrape ce que les routes async laissent remonter)
+app.post("/api/admin/settings/refresh-rate", requireAdmin, asyncRoute(async (req, res) => {
+  const result = await fetchAndApplyRate({ force: true });
+  res.json({ result, settings: await getAllSettings() });
+}));
+
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: "Erreur interne du serveur." });
@@ -209,6 +203,7 @@ const PORT = process.env.PORT || 3000;
 initSchema()
   .then(() => {
     app.listen(PORT, () => console.log(`API Momo Connect démarrée sur le port ${PORT}`));
+    startRateScheduler({ intervalHours: 6 });
   })
   .catch((err) => {
     console.error("Impossible d'initialiser la base de données :", err);
